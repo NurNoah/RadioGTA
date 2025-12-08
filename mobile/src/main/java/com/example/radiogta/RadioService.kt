@@ -15,6 +15,11 @@ import com.google.android.exoplayer2.Player
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
+import android.content.Context
+import android.os.Environment
+import android.net.Uri
+import java.io.File
+import java.io.FileOutputStream
 
 class RadioService : MediaBrowserServiceCompat() {
 
@@ -69,28 +74,62 @@ class RadioService : MediaBrowserServiceCompat() {
         }
     }
 
+    // Kopiert eine Asset-Datei in das app-spezifische Music-Verzeichnis (persistiert).
+    fun ensureAssetCopiedToExternalMusic(context: Context, assetRelativePath: String): File {
+        val destDir = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir
+        if (!destDir.exists()) destDir.mkdirs()
+
+        val fileName = assetRelativePath.substringAfterLast('/') // z.B. "los_santos_underground_radio.mp3"
+        val outFile = File(destDir, fileName)
+        if (outFile.exists()) return outFile
+
+        context.assets.open(assetRelativePath).use { input ->
+            FileOutputStream(outFile).use { output ->
+                input.copyTo(output)
+            }
+        }
+        return outFile
+    }
+
+    // Alternative: kurzlebig in cache (nur für Testzwecke)
+    fun ensureAssetCopiedToCache(context: Context, assetRelativePath: String): File {
+        val outFile = File(context.cacheDir, assetRelativePath.substringAfterLast('/'))
+        if (outFile.exists()) return outFile
+
+        // Stelle sicher, dass ggf. Unterordner in cache existieren (normal nicht nötig)
+        outFile.parentFile?.mkdirs()
+
+        context.assets.open(assetRelativePath).use { input ->
+            FileOutputStream(outFile).use { output ->
+                input.copyTo(output)
+            }
+        }
+        return outFile
+    }
+
     private fun playStation(station: RadioStation) {
-        // Hier laden wir die Datei aus dem RAW ordner oder Assets
-        // Für dieses Beispiel gehen wir davon aus, dass die Datei im "raw" Ordner liegt
-        // Format: android.resource://paketname/raw/dateiname_ohne_endung
+        // Wenn du assets/radio/... verwendet hast:
+        val assetPath = "radio/${station.assetFileName}" // z.B. "radio/blonded_radio.mp3"
 
-        // Achtung: Dateinamen müssen in StationManager ohne .mp3 Endung für Raw Resources sein,
-        // oder du baust den Pfad für Assets anders. Hier Beispiel für Raw Resource:
-        val resourceId = resources.getIdentifier(station.assetFileName.replace(".mp3", ""), "raw", packageName)
-        val uri = android.net.Uri.parse("android.resource://$packageName/$resourceId")
+        // Kopiere Asset in persistenten App-Ordner (einmalig). Nutze externalFilesDir, weil die Dateien groß sind.
+        val localFile = try {
+            ensureAssetCopiedToExternalMusic(this, assetPath)
+        } catch (e: Exception) {
+            // Fallback: cache (nur falls external nicht geht)
+            ensureAssetCopiedToCache(this, assetPath)
+        }
 
+        // Erstelle MediaItem aus lokalem File und spiele mit ExoPlayer
+        val uri = Uri.fromFile(localFile)
         val mediaItem = ExoMediaItem.fromUri(uri)
 
         exoPlayer.setMediaItem(mediaItem)
         exoPlayer.prepare()
-
-        // TRICK: Wir warten kurz bis die Duration bekannt ist, oder schätzen sie,
-        // aber ExoPlayer kennt die Duration erst nach prepare().
-        // Wir setzen playWhenReady = true, der Listener unten regelt den Seek.
         exoPlayer.playWhenReady = true
 
-        updateMetadata(station)
+        updateMetadata(station, localFile)
     }
+
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -115,42 +154,24 @@ class RadioService : MediaBrowserServiceCompat() {
 
 // In RadioService.kt
 
-    // Neue Hilfsfunktion, um die Metadaten zu extrahieren
-    private fun getAlbumArtBitmap(station: RadioStation): Bitmap? {
-        // 1. Pfad zur RAW-Ressource ermitteln
-        val resourceId = resources.getIdentifier(station.assetFileName.replace(".mp3", ""), "raw", packageName)
-        if (resourceId == 0) return null
-
-        // 2. URI erstellen
-        val uri = android.net.Uri.parse("android.resource://$packageName/$resourceId")
-
+    private fun getAlbumArtBitmapFromFile(file: File): Bitmap? {
         val retriever = MediaMetadataRetriever()
         return try {
-            // 3. Datei über URI an den Retriever übergeben
-            retriever.setDataSource(this, uri)
-
-            // 4. Eingebettetes Bild-Byte-Array holen
+            retriever.setDataSource(file.absolutePath)
             val art = retriever.embeddedPicture
-
-            // 5. Byte-Array zu Bitmap dekodieren
             if (art != null && art.isNotEmpty()) {
                 BitmapFactory.decodeByteArray(art, 0, art.size)
-            } else {
-                null
-            }
+            } else null
         } catch (e: Exception) {
-            // Fehlerbehandlung
             null
         } finally {
             retriever.release()
         }
     }
 
-    // Aktualisierte Funktion, die die Bitmap in die MediaSession lädt
-    private fun updateMetadata(station: RadioStation) {
-
-        // Zuerst das Bild laden
-        val albumArtBitmap = getAlbumArtBitmap(station)
+    // Update updateMetadata: bekommt die lokale Datei (falls vorhanden)
+    private fun updateMetadata(station: RadioStation, localFile: File? = null) {
+        val albumArtBitmap = localFile?.let { getAlbumArtBitmapFromFile(it) }
 
         val metadataBuilder = MediaMetadataCompat.Builder()
             .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, station.id)
@@ -159,14 +180,13 @@ class RadioService : MediaBrowserServiceCompat() {
             .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, "Grand Theft Auto V Radio")
 
         if (albumArtBitmap != null) {
-            // WICHTIG: Das Bild wird in zwei Schlüsseln gespeichert,
-            // damit es von Android Auto (Media Session) korrekt verwendet wird
             metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, albumArtBitmap)
             metadataBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, albumArtBitmap)
         }
 
         mediaSession.setMetadata(metadataBuilder.build())
     }
+
 
     private fun updatePlaybackState(state: Int) {
         val playbackState = PlaybackStateCompat.Builder()

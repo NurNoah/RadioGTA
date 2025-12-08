@@ -33,6 +33,7 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+    dynamicFeatures.addAll(listOf(":automotive"))
 }
 
 dependencies {
