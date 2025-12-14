@@ -33,11 +33,10 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
-    dynamicFeatures.addAll(listOf(":automotive"))
+    // ENTFERNT: dynamicFeatures - nicht benötigt für Android Auto
 }
 
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
