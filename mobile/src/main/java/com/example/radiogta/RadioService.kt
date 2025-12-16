@@ -15,25 +15,25 @@ import com.google.android.exoplayer2.Player
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
-import android.content.Context
-import android.os.Environment
 import android.net.Uri
+import android.util.Log
 import java.io.File
-import java.io.FileOutputStream
 
 class RadioService : MediaBrowserServiceCompat() {
 
     private lateinit var mediaSession: MediaSessionCompat
     private lateinit var exoPlayer: ExoPlayer
 
-    // IDs für die Ordner-Struktur
     private val MY_MEDIA_ROOT_ID = "root_media"
     private val MY_FAVORITES_ID = "root_favorites"
+
+    companion object {
+        private const val TAG = "RadioService"
+    }
 
     override fun onCreate() {
         super.onCreate()
 
-        // 1. MediaSession erstellen
         mediaSession = MediaSessionCompat(this, "GTARadioService").apply {
             setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
                     MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
@@ -42,12 +42,10 @@ class RadioService : MediaBrowserServiceCompat() {
             isActive = true
         }
 
-        // 2. ExoPlayer initialisieren
         exoPlayer = ExoPlayer.Builder(this).build()
         exoPlayer.addListener(playerListener)
     }
 
-    // --- Die Logik zum Abspielen ---
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
 
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
@@ -66,60 +64,28 @@ class RadioService : MediaBrowserServiceCompat() {
         }
 
         override fun onSkipToNext() {
-            // Logik um zum nächsten Sender in der Liste zu springen
+            // TODO: Zum nächsten Sender springen
         }
 
         override fun onSkipToPrevious() {
-            // Logik um zum vorherigen Sender zu springen
+            // TODO: Zum vorherigen Sender springen
         }
-    }
-
-    // Kopiert eine Asset-Datei in das app-spezifische Music-Verzeichnis (persistiert).
-    fun ensureAssetCopiedToExternalMusic(context: Context, assetRelativePath: String): File {
-        val destDir = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir
-        if (!destDir.exists()) destDir.mkdirs()
-
-        val fileName = assetRelativePath.substringAfterLast('/') // z.B. "los_santos_underground_radio.mp3"
-        val outFile = File(destDir, fileName)
-        if (outFile.exists()) return outFile
-
-        context.assets.open(assetRelativePath).use { input ->
-            FileOutputStream(outFile).use { output ->
-                input.copyTo(output)
-            }
-        }
-        return outFile
-    }
-
-    // Alternative: kurzlebig in cache (nur für Testzwecke)
-    fun ensureAssetCopiedToCache(context: Context, assetRelativePath: String): File {
-        val outFile = File(context.cacheDir, assetRelativePath.substringAfterLast('/'))
-        if (outFile.exists()) return outFile
-
-        // Stelle sicher, dass ggf. Unterordner in cache existieren (normal nicht nötig)
-        outFile.parentFile?.mkdirs()
-
-        context.assets.open(assetRelativePath).use { input ->
-            FileOutputStream(outFile).use { output ->
-                input.copyTo(output)
-            }
-        }
-        return outFile
     }
 
     private fun playStation(station: RadioStation) {
-        // Wenn du assets/radio/... verwendet hast:
-        val assetPath = "radio/${station.assetFileName}" // z.B. "radio/blonded_radio.mp3"
+        Log.d(TAG, "Attempting to play station: ${station.name}")
 
-        // Kopiere Asset in persistenten App-Ordner (einmalig). Nutze externalFilesDir, weil die Dateien groß sind.
-        val localFile = try {
-            ensureAssetCopiedToExternalMusic(this, assetPath)
-        } catch (e: Exception) {
-            // Fallback: cache (nur falls external nicht geht)
-            ensureAssetCopiedToCache(this, assetPath)
+        // Hole die Datei aus der OBB (wird beim ersten Mal extrahiert und gecacht)
+        val localFile = ObbHelper.getRadioFile(this, station.assetFileName)
+
+        if (localFile == null || !localFile.exists()) {
+            Log.e(TAG, "Could not load radio file: ${station.assetFileName}")
+            updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
+            return
         }
 
-        // Erstelle MediaItem aus lokalem File und spiele mit ExoPlayer
+        Log.d(TAG, "Playing from file: ${localFile.absolutePath}")
+
         val uri = Uri.fromFile(localFile)
         val mediaItem = ExoMediaItem.fromUri(uri)
 
@@ -130,29 +96,30 @@ class RadioService : MediaBrowserServiceCompat() {
         updateMetadata(station, localFile)
     }
 
-
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_READY && exoPlayer.playWhenReady) {
-                // JETZT simulieren wir, dass das Radio schon lief
                 val duration = exoPlayer.duration
                 val seekPosition = StationManager.getSimulatedPosition(duration)
 
-                // Nur seeken, wenn wir ganz am Anfang sind (damit es nicht springt wenn man Pause/Play drückt)
                 if (exoPlayer.currentPosition < 1000) {
                     exoPlayer.seekTo(seekPosition)
                 }
 
                 updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
             } else if (playbackState == Player.STATE_ENDED) {
-                // Loop: Wenn Datei zu Ende, fang von vorne an (passiert automatisch durch Simulation beim nächsten Start nicht, aber hier wichtig)
                 exoPlayer.seekTo(0)
                 exoPlayer.play()
+            } else if (playbackState == Player.STATE_IDLE) {
+                updatePlaybackState(PlaybackStateCompat.STATE_NONE)
             }
         }
-    }
 
-// In RadioService.kt
+        override fun onPlayerError(error: com.google.android.exoplayer2.PlaybackException) {
+            Log.e(TAG, "Player error: ${error.message}", error)
+            updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
+        }
+    }
 
     private fun getAlbumArtBitmapFromFile(file: File): Bitmap? {
         val retriever = MediaMetadataRetriever()
@@ -163,13 +130,13 @@ class RadioService : MediaBrowserServiceCompat() {
                 BitmapFactory.decodeByteArray(art, 0, art.size)
             } else null
         } catch (e: Exception) {
+            Log.e(TAG, "Error extracting album art", e)
             null
         } finally {
             retriever.release()
         }
     }
 
-    // Update updateMetadata: bekommt die lokale Datei (falls vorhanden)
     private fun updateMetadata(station: RadioStation, localFile: File? = null) {
         val albumArtBitmap = localFile?.let { getAlbumArtBitmapFromFile(it) }
 
@@ -187,18 +154,21 @@ class RadioService : MediaBrowserServiceCompat() {
         mediaSession.setMetadata(metadataBuilder.build())
     }
 
-
     private fun updatePlaybackState(state: Int) {
         val playbackState = PlaybackStateCompat.Builder()
-            .setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or PlaybackStateCompat.ACTION_SKIP_TO_NEXT or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS)
+            .setActions(
+                PlaybackStateCompat.ACTION_PLAY or
+                        PlaybackStateCompat.ACTION_PAUSE or
+                        PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                        PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID
+            )
             .setState(state, exoPlayer.currentPosition, 1.0f)
             .build()
         mediaSession.setPlaybackState(playbackState)
     }
 
-    // --- Browser Struktur (Das Menü im Auto) ---
     override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot? {
-        // Erlaubt jedem Auto/Handy Zugriff
         return BrowserRoot(MY_MEDIA_ROOT_ID, null)
     }
 
@@ -206,15 +176,12 @@ class RadioService : MediaBrowserServiceCompat() {
         val mediaItems = mutableListOf<MediaItem>()
 
         if (parentId == MY_MEDIA_ROOT_ID) {
-            // Hauptmenü Ordner
             mediaItems.add(createBrowsableItem(MY_FAVORITES_ID, "Favoriten", "Deine Top 4"))
 
-            // Liste aller Sender direkt anzeigen
             StationManager.stations.forEach { station ->
                 mediaItems.add(createPlayableItem(station))
             }
         } else if (parentId == MY_FAVORITES_ID) {
-            // Nur Favoriten laden
             StationManager.favoriteIds.forEach { favId ->
                 val station = StationManager.getStationById(favId)
                 if (station != null) {
@@ -231,7 +198,6 @@ class RadioService : MediaBrowserServiceCompat() {
             .setMediaId(station.id)
             .setTitle(station.name)
             .setSubtitle(station.genre)
-            // .setIconBitmap(...) // Hier Cover Art setzen für die Liste
             .build()
         return MediaItem(desc, MediaItem.FLAG_PLAYABLE)
     }
