@@ -1,5 +1,8 @@
 package com.example.radiogta
 
+import android.content.Context
+import android.util.Log
+
 data class RadioStation(
     val id: String,
     val name: String,
@@ -9,7 +12,13 @@ data class RadioStation(
 
 object StationManager {
 
-    private val globalRadioStartTime = System.currentTimeMillis()
+    private const val TAG = "StationManager"
+    private const val PREFS_NAME = "radio_prefs"
+    private const val KEY_LAST_TIMESTAMP = "last_timestamp"
+    private const val KEY_GLOBAL_START_TIME = "global_start_time"
+
+    // Globaler Radio-Start-Zeitpunkt (wird einmal beim ersten Start gesetzt)
+    private var globalRadioStartTime = System.currentTimeMillis()
 
     val stations = listOf(
         // --- Music Stations ---
@@ -43,9 +52,55 @@ object StationManager {
 
     fun getStationById(id: String): RadioStation? = stations.find { it.id == id }
 
+    /**
+     * Berechnet die aktuelle Position im Radio-Stream basierend auf der verstrichenen Zeit
+     * seit dem globalen Start-Zeitpunkt
+     */
     fun getSimulatedPosition(durationMs: Long): Long {
         if (durationMs <= 0) return 0
+
         val timePassed = System.currentTimeMillis() - globalRadioStartTime
-        return timePassed % durationMs
+        val position = timePassed % durationMs
+
+        Log.d(TAG, "Simulated position: ${position}ms of ${durationMs}ms (time passed: ${timePassed}ms)")
+        return position
+    }
+
+    /**
+     * Speichert die aktuelle Playback-Position und den Zeitstempel
+     */
+    fun savePlaybackPosition(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val currentTime = System.currentTimeMillis()
+
+        prefs.edit().apply {
+            putLong(KEY_LAST_TIMESTAMP, currentTime)
+            putLong(KEY_GLOBAL_START_TIME, globalRadioStartTime)
+            apply()
+        }
+
+        Log.d(TAG, "Saved playback position at timestamp: $currentTime")
+    }
+
+    /**
+     * Stellt die Playback-Position wieder her basierend auf der verstrichenen Zeit
+     */
+    fun restorePlaybackPosition(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val lastTimestamp = prefs.getLong(KEY_LAST_TIMESTAMP, 0)
+        val savedStartTime = prefs.getLong(KEY_GLOBAL_START_TIME, 0)
+
+        if (savedStartTime > 0) {
+            // Stelle den globalen Start-Zeitpunkt wieder her
+            globalRadioStartTime = savedStartTime
+
+            val timeSinceLastSave = System.currentTimeMillis() - lastTimestamp
+            Log.d(TAG, "Restored playback position. Time since last save: ${timeSinceLastSave}ms")
+            Log.d(TAG, "Radio has been running since: $globalRadioStartTime")
+        } else {
+            // Erstes Mal - setze neuen Start-Zeitpunkt
+            globalRadioStartTime = System.currentTimeMillis()
+            Log.d(TAG, "First launch - initialized radio start time: $globalRadioStartTime")
+        }
     }
 }

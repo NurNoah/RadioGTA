@@ -1,14 +1,20 @@
 package com.example.radiogta
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.support.v4.media.MediaBrowserCompat.MediaItem
 import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import androidx.core.app.NotificationCompat
 import androidx.media.MediaBrowserServiceCompat
+import androidx.media.app.NotificationCompat.MediaStyle
 import com.google.android.exoplayer2.ExoPlayer
 import com.google.android.exoplayer2.MediaItem as ExoMediaItem
 import com.google.android.exoplayer2.Player
@@ -23,9 +29,16 @@ class RadioService : MediaBrowserServiceCompat() {
 
     private lateinit var mediaSession: MediaSessionCompat
     private lateinit var exoPlayer: ExoPlayer
+    private var currentStationIndex = 0
+    private var isMuted = false
 
     private val MY_MEDIA_ROOT_ID = "root_media"
     private val MY_FAVORITES_ID = "root_favorites"
+    private val NOTIFICATION_ID = 1
+    private val CHANNEL_ID = "radio_playback_channel"
+
+    // Cache für Album-Arts
+    private val albumArtCache = mutableMapOf<String, Bitmap>()
 
     companion object {
         private const val TAG = "RadioService"
@@ -34,9 +47,17 @@ class RadioService : MediaBrowserServiceCompat() {
     override fun onCreate() {
         super.onCreate()
 
+        // Notification Channel erstellen
+        createNotificationChannel()
+
+        // Gespeicherte Position wiederherstellen
+        StationManager.restorePlaybackPosition(this)
+
         mediaSession = MediaSessionCompat(this, "GTARadioService").apply {
-            setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
-                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
+            setFlags(
+                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+                        MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
+            )
             setCallback(mediaSessionCallback)
             setSessionToken(sessionToken)
             isActive = true
@@ -44,38 +65,104 @@ class RadioService : MediaBrowserServiceCompat() {
 
         exoPlayer = ExoPlayer.Builder(this).build()
         exoPlayer.addListener(playerListener)
+
+        // Initiales PlaybackState setzen
+        updatePlaybackState(PlaybackStateCompat.STATE_NONE)
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Radio Playback",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Radio playback controls"
+                setShowBadge(false)
+            }
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+        }
     }
 
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
 
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
             mediaId?.let { id ->
-                val station = StationManager.getStationById(id) ?: return
-                playStation(station)
+                val station = StationManager.getStationById(id)
+                if (station != null) {
+                    currentStationIndex = StationManager.stations.indexOf(station)
+                    playStation(station)
+                }
             }
         }
 
         override fun onPlay() {
-            exoPlayer.play()
+            if (exoPlayer.currentMediaItem == null) {
+                // Wenn noch nichts geladen ist, ersten Sender laden
+                playStation(StationManager.stations[currentStationIndex])
+            } else {
+                // Wenn gemutet, unmuten statt play
+                if (isMuted) {
+                    isMuted = false
+                    exoPlayer.volume = 1.0f
+                } else {
+                    exoPlayer.play()
+                }
+                updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+                updateNotification()
+            }
         }
 
         override fun onPause() {
-            exoPlayer.pause()
+            // Pause = Mute (nicht komplett stoppen)
+            isMuted = true
+            exoPlayer.volume = 0.0f
+
+            // Position speichern
+            StationManager.savePlaybackPosition(this@RadioService)
+
+            updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
+            updateNotification()
         }
 
         override fun onSkipToNext() {
-            // TODO: Zum nächsten Sender springen
+            // Nächster Sender
+            currentStationIndex = (currentStationIndex + 1) % StationManager.stations.size
+            playStation(StationManager.stations[currentStationIndex])
         }
 
         override fun onSkipToPrevious() {
-            // TODO: Zum vorherigen Sender springen
+            // Vorheriger Sender
+            currentStationIndex = if (currentStationIndex - 1 < 0) {
+                StationManager.stations.size - 1
+            } else {
+                currentStationIndex - 1
+            }
+            playStation(StationManager.stations[currentStationIndex])
+        }
+
+        override fun onStop() {
+            // Position speichern bevor wir stoppen
+            StationManager.savePlaybackPosition(this@RadioService)
+
+            exoPlayer.stop()
+            updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
+            stopForeground(true)
+            stopSelf()
         }
     }
 
     private fun playStation(station: RadioStation) {
         Log.d(TAG, "Attempting to play station: ${station.name}")
 
-        // Hole die Datei aus der OBB (wird beim ersten Mal extrahiert und gecacht)
+        // Unmute wenn gemutet
+        if (isMuted) {
+            isMuted = false
+            exoPlayer.volume = 1.0f
+        }
+
+        // Hole die Datei aus der OBB
         val localFile = ObbHelper.getRadioFile(this, station.assetFileName)
 
         if (localFile == null || !localFile.exists()) {
@@ -102,12 +189,18 @@ class RadioService : MediaBrowserServiceCompat() {
                 val duration = exoPlayer.duration
                 val seekPosition = StationManager.getSimulatedPosition(duration)
 
-                if (exoPlayer.currentPosition < 1000) {
+                // Zur berechneten Position springen
+                if (exoPlayer.currentPosition < 1000 ||
+                    kotlin.math.abs(exoPlayer.currentPosition - seekPosition) > 2000) {
                     exoPlayer.seekTo(seekPosition)
+                    Log.d(TAG, "Seeked to position: ${seekPosition}ms (duration: ${duration}ms)")
                 }
 
-                updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+                val state = if (isMuted) PlaybackStateCompat.STATE_PAUSED else PlaybackStateCompat.STATE_PLAYING
+                updatePlaybackState(state)
+                updateNotification()
             } else if (playbackState == Player.STATE_ENDED) {
+                // Loop
                 exoPlayer.seekTo(0)
                 exoPlayer.play()
             } else if (playbackState == Player.STATE_IDLE) {
@@ -152,6 +245,7 @@ class RadioService : MediaBrowserServiceCompat() {
         }
 
         mediaSession.setMetadata(metadataBuilder.build())
+        updateNotification()
     }
 
     private fun updatePlaybackState(state: Int) {
@@ -161,57 +255,175 @@ class RadioService : MediaBrowserServiceCompat() {
                         PlaybackStateCompat.ACTION_PAUSE or
                         PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
                         PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
-                        PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID
+                        PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
+                        PlaybackStateCompat.ACTION_STOP
             )
             .setState(state, exoPlayer.currentPosition, 1.0f)
             .build()
         mediaSession.setPlaybackState(playbackState)
     }
 
-    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot? {
+    private fun updateNotification() {
+        val metadata = mediaSession.controller.metadata
+        if (metadata == null) {
+            Log.d(TAG, "No metadata available for notification")
+            return
+        }
+
+        val description = metadata.description
+        val state = mediaSession.controller.playbackState?.state ?: PlaybackStateCompat.STATE_NONE
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(description.title)
+            .setContentText(description.subtitle)
+            .setSubText(description.description)
+            .setLargeIcon(metadata.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART))
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentIntent(mediaSession.controller.sessionActivity)
+            .setDeleteIntent(
+                androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
+                    this,
+                    PlaybackStateCompat.ACTION_STOP
+                )
+            )
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .addAction(
+                NotificationCompat.Action(
+                    android.R.drawable.ic_media_previous,
+                    "Previous",
+                    androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
+                        this,
+                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+                    )
+                )
+            )
+            .addAction(
+                if (state == PlaybackStateCompat.STATE_PLAYING) {
+                    NotificationCompat.Action(
+                        android.R.drawable.ic_media_pause,
+                        "Pause",
+                        androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
+                            this,
+                            PlaybackStateCompat.ACTION_PAUSE
+                        )
+                    )
+                } else {
+                    NotificationCompat.Action(
+                        android.R.drawable.ic_media_play,
+                        "Play",
+                        androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
+                            this,
+                            PlaybackStateCompat.ACTION_PLAY
+                        )
+                    )
+                }
+            )
+            .addAction(
+                NotificationCompat.Action(
+                    android.R.drawable.ic_media_next,
+                    "Next",
+                    androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
+                        this,
+                        PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+                    )
+                )
+            )
+            .setStyle(
+                MediaStyle()
+                    .setMediaSession(mediaSession.sessionToken)
+                    .setShowActionsInCompactView(0, 1, 2)
+            )
+            .build()
+
+        startForeground(NOTIFICATION_ID, notification)
+    }
+
+    override fun onGetRoot(
+        clientPackageName: String,
+        clientUid: Int,
+        rootHints: Bundle?
+    ): BrowserRoot? {
         return BrowserRoot(MY_MEDIA_ROOT_ID, null)
     }
 
     override fun onLoadChildren(parentId: String, result: Result<MutableList<MediaItem>>) {
-        val mediaItems = mutableListOf<MediaItem>()
+        // Result detachen für asynchrones Laden
+        result.detach()
 
-        if (parentId == MY_MEDIA_ROOT_ID) {
-            mediaItems.add(createBrowsableItem(MY_FAVORITES_ID, "Favoriten", "Deine Top 4"))
+        // Im Hintergrund laden
+        Thread {
+            val mediaItems = mutableListOf<MediaItem>()
 
-            StationManager.stations.forEach { station ->
-                mediaItems.add(createPlayableItem(station))
-            }
-        } else if (parentId == MY_FAVORITES_ID) {
-            StationManager.favoriteIds.forEach { favId ->
-                val station = StationManager.getStationById(favId)
-                if (station != null) {
-                    mediaItems.add(createPlayableItem(station))
+            if (parentId == MY_MEDIA_ROOT_ID) {
+                mediaItems.add(createBrowsableItem(MY_FAVORITES_ID, "Favoriten", "Deine Top 4", null))
+
+                StationManager.stations.forEach { station ->
+                    val albumArt = getOrLoadAlbumArt(station)
+                    mediaItems.add(createPlayableItem(station, albumArt))
                 }
+            } else if (parentId == MY_FAVORITES_ID) {
+                StationManager.favoriteIds.forEach { favId ->
+                    val station = StationManager.getStationById(favId)
+                    if (station != null) {
+                        val albumArt = getOrLoadAlbumArt(station)
+                        mediaItems.add(createPlayableItem(station, albumArt))
+                    }
+                }
+            }
+
+            result.sendResult(mediaItems)
+        }.start()
+    }
+
+    private fun getOrLoadAlbumArt(station: RadioStation): Bitmap? {
+        // Prüfe Cache
+        albumArtCache[station.id]?.let { return it }
+
+        // Lade aus Datei
+        val localFile = ObbHelper.getRadioFile(this, station.assetFileName)
+        if (localFile != null && localFile.exists()) {
+            val bitmap = getAlbumArtBitmapFromFile(localFile)
+            if (bitmap != null) {
+                albumArtCache[station.id] = bitmap
+                return bitmap
             }
         }
 
-        result.sendResult(mediaItems)
+        return null
     }
 
-    private fun createPlayableItem(station: RadioStation): MediaItem {
-        val desc = MediaDescriptionCompat.Builder()
+    private fun createPlayableItem(station: RadioStation, albumArt: Bitmap? = null): MediaItem {
+        val descBuilder = MediaDescriptionCompat.Builder()
             .setMediaId(station.id)
             .setTitle(station.name)
             .setSubtitle(station.genre)
-            .build()
-        return MediaItem(desc, MediaItem.FLAG_PLAYABLE)
+
+        // Album-Art setzen wenn vorhanden
+        if (albumArt != null) {
+            descBuilder.setIconBitmap(albumArt)
+        }
+
+        return MediaItem(descBuilder.build(), MediaItem.FLAG_PLAYABLE)
     }
 
-    private fun createBrowsableItem(id: String, title: String, subtitle: String): MediaItem {
-        val desc = MediaDescriptionCompat.Builder()
+    private fun createBrowsableItem(id: String, title: String, subtitle: String, icon: Bitmap? = null): MediaItem {
+        val descBuilder = MediaDescriptionCompat.Builder()
             .setMediaId(id)
             .setTitle(title)
             .setSubtitle(subtitle)
-            .build()
-        return MediaItem(desc, MediaItem.FLAG_BROWSABLE)
+
+        if (icon != null) {
+            descBuilder.setIconBitmap(icon)
+        }
+
+        return MediaItem(descBuilder.build(), MediaItem.FLAG_BROWSABLE)
     }
 
     override fun onDestroy() {
+        // Position speichern bevor Service zerstört wird
+        StationManager.savePlaybackPosition(this)
+
         mediaSession.release()
         exoPlayer.release()
         super.onDestroy()
