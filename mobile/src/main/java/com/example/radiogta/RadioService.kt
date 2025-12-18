@@ -66,8 +66,14 @@ class RadioService : MediaBrowserServiceCompat() {
         exoPlayer = ExoPlayer.Builder(this).build()
         exoPlayer.addListener(playerListener)
 
-        // Initiales PlaybackState setzen
-        updatePlaybackState(PlaybackStateCompat.STATE_NONE)
+        // Letzten Sender laden und automatisch abspielen
+        val lastStation = StationManager.getLastStation(this)
+        currentStationIndex = StationManager.stations.indexOf(lastStation)
+
+        Log.d(TAG, "Auto-starting with last station: ${lastStation.name}")
+
+        // Sender automatisch laden und abspielen
+        playStation(lastStation)
     }
 
     private fun createNotificationChannel() {
@@ -99,8 +105,10 @@ class RadioService : MediaBrowserServiceCompat() {
 
         override fun onPlay() {
             if (exoPlayer.currentMediaItem == null) {
-                // Wenn noch nichts geladen ist, ersten Sender laden
-                playStation(StationManager.stations[currentStationIndex])
+                // Wenn noch nichts geladen ist, letzten Sender laden
+                val lastStation = StationManager.getLastStation(this@RadioService)
+                currentStationIndex = StationManager.stations.indexOf(lastStation)
+                playStation(lastStation)
             } else {
                 // Wenn gemutet, unmuten statt play
                 if (isMuted) {
@@ -155,6 +163,9 @@ class RadioService : MediaBrowserServiceCompat() {
 
     private fun playStation(station: RadioStation) {
         Log.d(TAG, "Attempting to play station: ${station.name}")
+
+        // Sender speichern
+        StationManager.saveCurrentStation(this, station.id)
 
         // Unmute wenn gemutet
         if (isMuted) {

@@ -16,6 +16,7 @@ object StationManager {
     private const val PREFS_NAME = "radio_prefs"
     private const val KEY_LAST_TIMESTAMP = "last_timestamp"
     private const val KEY_GLOBAL_START_TIME = "global_start_time"
+    private const val KEY_LAST_STATION_ID = "last_station_id"
 
     // Globaler Radio-Start-Zeitpunkt (wird einmal beim ersten Start gesetzt)
     private var globalRadioStartTime = System.currentTimeMillis()
@@ -51,6 +52,29 @@ object StationManager {
     val favoriteIds = mutableListOf("los_santos_rock", "non_stop_pop", "west_coast_classics", "blonded_radio")
 
     fun getStationById(id: String): RadioStation? = stations.find { it.id == id }
+
+    /**
+     * Speichert die ID des aktuell gespielten Senders
+     */
+    fun saveCurrentStation(context: Context, stationId: String) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(KEY_LAST_STATION_ID, stationId).apply()
+        Log.d(TAG, "Saved current station: $stationId")
+    }
+
+    /**
+     * Lädt den zuletzt gespielten Sender oder gibt den ersten Sender zurück
+     */
+    fun getLastStation(context: Context): RadioStation {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val lastId = prefs.getString(KEY_LAST_STATION_ID, null)
+
+        return if (lastId != null) {
+            getStationById(lastId) ?: stations[0]
+        } else {
+            stations[0] // Default: Erster Sender (Blonded Radio)
+        }
+    }
 
     /**
      * Berechnet die aktuelle Position im Radio-Stream basierend auf der verstrichenen Zeit

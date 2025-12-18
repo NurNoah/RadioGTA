@@ -21,4 +21,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "RadioGTA"
 include(":mobile")
-include(":shared")
