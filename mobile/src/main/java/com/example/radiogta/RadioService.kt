@@ -36,6 +36,13 @@ class RadioService : MediaBrowserServiceCompat() {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var currentStationIndex = 0
     private var isMuted = false
+    private var hasAudioFocus = false
+    private var isAudioFocusRequestPending = false
+    private var playbackRequested = false
+    private var resumeOnAudioFocusGain = false
+    private var isDucked = false
+    private var pendingStation: RadioStation? = null
+    private var pendingStationFile: File? = null
 
     private val MY_MEDIA_ROOT_ID = "root_media"
     private val MY_FAVORITES_ID = "root_favorites"
@@ -71,29 +78,29 @@ class RadioService : MediaBrowserServiceCompat() {
             isActive = true
         }
 
-        // ExoPlayer mit AudioAttributes erstellen
+        // ExoPlayer mit AudioAttributes erstellen - KEIN Auto-Handling!
         val audioAttributes = com.google.android.exoplayer2.audio.AudioAttributes.Builder()
             .setUsage(com.google.android.exoplayer2.C.USAGE_MEDIA)
             .setContentType(com.google.android.exoplayer2.C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
 
         exoPlayer = ExoPlayer.Builder(this)
-            .setAudioAttributes(audioAttributes, true) // handleAudioFocus = true
+            .setAudioAttributes(audioAttributes, false) // handleAudioFocus = FALSE! Machen wir selbst
             .build()
         exoPlayer.addListener(playerListener)
 
-        // Letzten Sender laden und automatisch abspielen
+        // Letzten Sender für Android Auto anzeigen. Die Wiedergabe wird erst durch einen
+        // onPlay-/onPlayFromMediaId-Aufruf gestartet. So wird Audio Focus nicht schon beim
+        // bloßen Verbinden des Fahrzeugs angefordert.
         val lastStation = StationManager.getLastStation(this)
         currentStationIndex = StationManager.stations.indexOf(lastStation)
-
-        Log.d(TAG, "Auto-starting with last station: ${lastStation.name}")
-
-        // Audio Focus anfordern und Sender laden
-        if (requestAudioFocus()) {
-            playStation(lastStation)
-        } else {
-            Log.e(TAG, "Failed to gain audio focus on startup")
-        }
+        updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
+        updateMetadata(
+            lastStation,
+            ObbHelper.getRadioFile(this, lastStation.assetFileName),
+            showNotification = false
+        )
+        Log.d(TAG, "Ready with last station: ${lastStation.name}")
     }
 
     private fun createNotificationChannel() {
@@ -111,7 +118,16 @@ class RadioService : MediaBrowserServiceCompat() {
         }
     }
 
-    private fun requestAudioFocus(): Boolean {
+    private fun requestAudioFocus(): Int {
+        if (hasAudioFocus) {
+            Log.d(TAG, "Already have audio focus")
+            return AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+        if (isAudioFocusRequestPending) {
+            Log.d(TAG, "Audio focus request is already pending")
+            return AudioManager.AUDIOFOCUS_REQUEST_DELAYED
+        }
+
         val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -121,6 +137,7 @@ class RadioService : MediaBrowserServiceCompat() {
             audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(audioAttributes)
                 .setAcceptsDelayedFocusGain(true)
+                .setWillPauseWhenDucked(false)
                 .setOnAudioFocusChangeListener(audioFocusChangeListener)
                 .build()
 
@@ -134,12 +151,15 @@ class RadioService : MediaBrowserServiceCompat() {
             )
         }
 
-        val success = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        Log.d(TAG, "Audio focus request result: $success")
-        return success
+        hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        isAudioFocusRequestPending = result == AudioManager.AUDIOFOCUS_REQUEST_DELAYED
+        Log.d(TAG, "Audio focus request result: $result")
+        return result
     }
 
     private fun abandonAudioFocus() {
+        if (!hasAudioFocus && !isAudioFocusRequestPending) return
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             audioFocusRequest?.let {
                 audioManager.abandonAudioFocusRequest(it)
@@ -148,46 +168,68 @@ class RadioService : MediaBrowserServiceCompat() {
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(audioFocusChangeListener)
         }
+        hasAudioFocus = false
+        isAudioFocusRequestPending = false
         Log.d(TAG, "Audio focus abandoned")
     }
 
     private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        Log.d(TAG, "Audio focus changed: $focusChange")
         when (focusChange) {
             AudioManager.AUDIOFOCUS_GAIN -> {
-                Log.d(TAG, "Audio focus gained")
-                if (isMuted) {
+                hasAudioFocus = true
+                isAudioFocusRequestPending = false
+                val shouldResume = resumeOnAudioFocusGain || isMuted || isDucked
+                isDucked = false
+
+                if (pendingStation != null && playbackRequested) {
+                    startPendingStation()
+                } else if (playbackRequested && shouldResume) {
                     isMuted = false
                     exoPlayer.volume = 1.0f
-                }
-                if (!exoPlayer.playWhenReady) {
                     exoPlayer.play()
+                    updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+                    updateNotification()
                 }
+                resumeOnAudioFocusGain = false
             }
             AudioManager.AUDIOFOCUS_LOSS -> {
-                Log.d(TAG, "Audio focus lost permanently")
-                mediaSessionCallback.onPause()
+                hasAudioFocus = false
+                isAudioFocusRequestPending = false
+                resumeOnAudioFocusGain = false
+                playbackRequested = false
+                pendingStation = null
+                pendingStationFile = null
+                pauseForAudioFocusLoss()
+                stopForeground(STOP_FOREGROUND_DETACH)
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                Log.d(TAG, "Audio focus lost temporarily")
-                mediaSessionCallback.onPause()
+                hasAudioFocus = false
+                isAudioFocusRequestPending = false
+                resumeOnAudioFocusGain = playbackRequested
+                pauseForAudioFocusLoss()
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                Log.d(TAG, "Audio focus lost - can duck")
+                isDucked = true
                 exoPlayer.volume = 0.3f
             }
         }
     }
 
+    private fun pauseForAudioFocusLoss() {
+        isMuted = true
+        exoPlayer.volume = 0.0f
+        updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
+        updateNotification()
+    }
+
     private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
 
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
+            Log.d(TAG, "onPlayFromMediaId: $mediaId")
             mediaId?.let { id ->
                 val station = StationManager.getStationById(id)
                 if (station != null) {
-                    if (!requestAudioFocus()) {
-                        Log.e(TAG, "Failed to gain audio focus for media ID")
-                        return
-                    }
                     currentStationIndex = StationManager.stations.indexOf(station)
                     playStation(station)
                 }
@@ -195,10 +237,7 @@ class RadioService : MediaBrowserServiceCompat() {
         }
 
         override fun onPlay() {
-            if (!requestAudioFocus()) {
-                Log.e(TAG, "Failed to gain audio focus")
-                return
-            }
+            Log.d(TAG, "onPlay called")
 
             if (exoPlayer.currentMediaItem == null) {
                 // Wenn noch nichts geladen ist, letzten Sender laden
@@ -206,45 +245,54 @@ class RadioService : MediaBrowserServiceCompat() {
                 currentStationIndex = StationManager.stations.indexOf(lastStation)
                 playStation(lastStation)
             } else {
-                // Wenn gemutet, unmuten statt play
-                if (isMuted) {
-                    isMuted = false
-                    exoPlayer.volume = 1.0f
-                } else {
-                    exoPlayer.play()
-                }
-                updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+                playbackRequested = true
+                resumeOnAudioFocusGain = true
+
+                // Ab Android 15 darf Audio Focus nur als Top-App oder aus einem laufenden
+                // Foreground Service angefordert werden. Deshalb zuerst die Media-
+                // Benachrichtigung aktivieren und anschließend Focus anfordern.
                 updateNotification()
+                when (requestAudioFocus()) {
+                    AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> resumeCurrentStation()
+                    AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> {
+                        isMuted = true
+                        exoPlayer.volume = 0.0f
+                        updatePlaybackState(PlaybackStateCompat.STATE_BUFFERING)
+                        updateNotification()
+                    }
+                    else -> handleAudioFocusFailure()
+                }
             }
         }
 
         override fun onPause() {
+            Log.d(TAG, "onPause called")
             // Pause = Mute (nicht komplett stoppen)
+            playbackRequested = false
+            resumeOnAudioFocusGain = false
+            pendingStation = null
+            pendingStationFile = null
             isMuted = true
             exoPlayer.volume = 0.0f
+            abandonAudioFocus()
 
             // Position speichern
             StationManager.savePlaybackPosition(this@RadioService)
 
             updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
             updateNotification()
+            stopForeground(STOP_FOREGROUND_DETACH)
         }
 
         override fun onSkipToNext() {
-            if (!requestAudioFocus()) {
-                Log.e(TAG, "Failed to gain audio focus for skip next")
-                return
-            }
+            Log.d(TAG, "onSkipToNext called")
             // Nächster Sender
             currentStationIndex = (currentStationIndex + 1) % StationManager.stations.size
             playStation(StationManager.stations[currentStationIndex])
         }
 
         override fun onSkipToPrevious() {
-            if (!requestAudioFocus()) {
-                Log.e(TAG, "Failed to gain audio focus for skip previous")
-                return
-            }
+            Log.d(TAG, "onSkipToPrevious called")
             // Vorheriger Sender
             currentStationIndex = if (currentStationIndex - 1 < 0) {
                 StationManager.stations.size - 1
@@ -255,28 +303,27 @@ class RadioService : MediaBrowserServiceCompat() {
         }
 
         override fun onStop() {
+            Log.d(TAG, "onStop called")
             // Position speichern bevor wir stoppen
             StationManager.savePlaybackPosition(this@RadioService)
 
+            playbackRequested = false
+            resumeOnAudioFocusGain = false
+            pendingStation = null
+            pendingStationFile = null
             exoPlayer.stop()
             abandonAudioFocus()
             updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
-            stopForeground(true)
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
     }
 
     private fun playStation(station: RadioStation) {
-        Log.d(TAG, "Attempting to play station: ${station.name}")
+        Log.d(TAG, "=== playStation START: ${station.name} ===")
 
         // Sender speichern
         StationManager.saveCurrentStation(this, station.id)
-
-        // Unmute wenn gemutet
-        if (isMuted) {
-            isMuted = false
-            exoPlayer.volume = 1.0f
-        }
 
         // Hole die Datei aus der OBB
         val localFile = ObbHelper.getRadioFile(this, station.assetFileName)
@@ -288,6 +335,40 @@ class RadioService : MediaBrowserServiceCompat() {
         }
 
         Log.d(TAG, "Playing from file: ${localFile.absolutePath}")
+        Log.d(TAG, "File size: ${localFile.length()} bytes")
+
+        playbackRequested = true
+        resumeOnAudioFocusGain = true
+        pendingStation = station
+        pendingStationFile = localFile
+        isMuted = true
+        exoPlayer.volume = 0.0f
+
+        // startForeground muss vor requestAudioFocus passieren, sonst wird die Focus-
+        // Anfrage bei targetSdk 35+ abgelehnt, wenn Android Auto im Vordergrund ist.
+        updatePlaybackState(PlaybackStateCompat.STATE_BUFFERING)
+        updateMetadata(station, localFile)
+
+        when (requestAudioFocus()) {
+            AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> startPendingStation()
+            AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> {
+                Log.d(TAG, "Waiting for delayed audio focus before starting playback")
+            }
+            else -> handleAudioFocusFailure()
+        }
+
+        Log.d(TAG, "=== playStation END ===")
+    }
+
+    private fun startPendingStation() {
+        pendingStation ?: return
+        val localFile = pendingStationFile ?: return
+        pendingStation = null
+        pendingStationFile = null
+        resumeOnAudioFocusGain = false
+        isMuted = false
+        isDucked = false
+        exoPlayer.volume = 1.0f
 
         val uri = Uri.fromFile(localFile)
         val mediaItem = ExoMediaItem.fromUri(uri)
@@ -296,11 +377,48 @@ class RadioService : MediaBrowserServiceCompat() {
         exoPlayer.prepare()
         exoPlayer.playWhenReady = true
 
-        updateMetadata(station, localFile)
+        Log.d(TAG, "ExoPlayer prepared and play requested")
+    }
+
+    private fun resumeCurrentStation() {
+        resumeOnAudioFocusGain = false
+        isMuted = false
+        isDucked = false
+        exoPlayer.volume = 1.0f
+        exoPlayer.play()
+        updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+        updateNotification()
+    }
+
+    private fun handleAudioFocusFailure() {
+        Log.e(TAG, "Audio focus request failed")
+        playbackRequested = false
+        resumeOnAudioFocusGain = false
+        pendingStation = null
+        pendingStationFile = null
+        isMuted = true
+        exoPlayer.volume = 0.0f
+        exoPlayer.stop()
+        exoPlayer.clearMediaItems()
+        updatePlaybackState(
+            PlaybackStateCompat.STATE_ERROR,
+            "Audioausgabe konnte nicht gestartet werden"
+        )
+        updateNotification()
+        stopForeground(STOP_FOREGROUND_DETACH)
     }
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
+            val stateName = when(playbackState) {
+                Player.STATE_IDLE -> "IDLE"
+                Player.STATE_BUFFERING -> "BUFFERING"
+                Player.STATE_READY -> "READY"
+                Player.STATE_ENDED -> "ENDED"
+                else -> "UNKNOWN"
+            }
+            Log.d(TAG, "ExoPlayer state changed: $stateName, playWhenReady: ${exoPlayer.playWhenReady}")
+
             if (playbackState == Player.STATE_READY && exoPlayer.playWhenReady) {
                 val duration = exoPlayer.duration
                 val seekPosition = StationManager.getSimulatedPosition(duration)
@@ -326,7 +444,12 @@ class RadioService : MediaBrowserServiceCompat() {
 
         override fun onPlayerError(error: com.google.android.exoplayer2.PlaybackException) {
             Log.e(TAG, "Player error: ${error.message}", error)
+            Log.e(TAG, "Error cause: ${error.cause}")
             updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            Log.d(TAG, "onIsPlayingChanged: $isPlaying")
         }
     }
 
@@ -346,7 +469,11 @@ class RadioService : MediaBrowserServiceCompat() {
         }
     }
 
-    private fun updateMetadata(station: RadioStation, localFile: File? = null) {
+    private fun updateMetadata(
+        station: RadioStation,
+        localFile: File? = null,
+        showNotification: Boolean = true
+    ) {
         val albumArtBitmap = localFile?.let { getAlbumArtBitmapFromFile(it) }
 
         val metadataBuilder = MediaMetadataCompat.Builder()
@@ -361,11 +488,22 @@ class RadioService : MediaBrowserServiceCompat() {
         }
 
         mediaSession.setMetadata(metadataBuilder.build())
-        updateNotification()
+        if (showNotification) {
+            updateNotification()
+        }
     }
 
-    private fun updatePlaybackState(state: Int) {
-        val playbackState = PlaybackStateCompat.Builder()
+    private fun updatePlaybackState(state: Int, errorMessage: String? = null) {
+        val stateName = when(state) {
+            PlaybackStateCompat.STATE_PLAYING -> "PLAYING"
+            PlaybackStateCompat.STATE_PAUSED -> "PAUSED"
+            PlaybackStateCompat.STATE_STOPPED -> "STOPPED"
+            PlaybackStateCompat.STATE_ERROR -> "ERROR"
+            else -> "OTHER($state)"
+        }
+        Log.d(TAG, "updatePlaybackState: $stateName")
+
+        val playbackStateBuilder = PlaybackStateCompat.Builder()
             .setActions(
                 PlaybackStateCompat.ACTION_PLAY or
                         PlaybackStateCompat.ACTION_PAUSE or
@@ -375,8 +513,14 @@ class RadioService : MediaBrowserServiceCompat() {
                         PlaybackStateCompat.ACTION_STOP
             )
             .setState(state, exoPlayer.currentPosition, 1.0f)
-            .build()
-        mediaSession.setPlaybackState(playbackState)
+
+        if (state == PlaybackStateCompat.STATE_ERROR && errorMessage != null) {
+            playbackStateBuilder.setErrorMessage(
+                PlaybackStateCompat.ERROR_CODE_APP_ERROR,
+                errorMessage
+            )
+        }
+        mediaSession.setPlaybackState(playbackStateBuilder.build())
     }
 
     private fun updateNotification() {
