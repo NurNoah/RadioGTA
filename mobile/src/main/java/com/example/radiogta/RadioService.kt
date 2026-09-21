@@ -26,7 +26,6 @@ import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.Log
-import java.io.File
 
 class RadioService : MediaBrowserServiceCompat() {
 
@@ -42,7 +41,7 @@ class RadioService : MediaBrowserServiceCompat() {
     private var resumeOnAudioFocusGain = false
     private var isDucked = false
     private var pendingStation: RadioStation? = null
-    private var pendingStationFile: File? = null
+    private var pendingStationUri: Uri? = null
 
     private val MY_MEDIA_ROOT_ID = "root_media"
     private val MY_FAVORITES_ID = "root_favorites"
@@ -54,6 +53,9 @@ class RadioService : MediaBrowserServiceCompat() {
 
     companion object {
         private const val TAG = "RadioService"
+
+        // Custom Action: Sender-Ordner wurde in der App geändert
+        const val ACTION_REFRESH_LIBRARY = "com.example.radiogta.REFRESH_LIBRARY"
     }
 
     override fun onCreate() {
@@ -95,12 +97,14 @@ class RadioService : MediaBrowserServiceCompat() {
         val lastStation = StationManager.getLastStation(this)
         currentStationIndex = StationManager.stations.indexOf(lastStation)
         updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
-        updateMetadata(
-            lastStation,
-            ObbHelper.getRadioFile(this, lastStation.assetFileName),
-            showNotification = false
-        )
+        updateMetadata(lastStation, showNotification = false)
         Log.d(TAG, "Ready with last station: ${lastStation.name}")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Buttons der Benachrichtigung / Kopfhörer kommen über den MediaButtonReceiver hier an
+        androidx.media.session.MediaButtonReceiver.handleIntent(mediaSession, intent)
+        return START_NOT_STICKY
     }
 
     private fun createNotificationChannel() {
@@ -199,7 +203,7 @@ class RadioService : MediaBrowserServiceCompat() {
                 resumeOnAudioFocusGain = false
                 playbackRequested = false
                 pendingStation = null
-                pendingStationFile = null
+                pendingStationUri = null
                 pauseForAudioFocusLoss()
                 stopForeground(STOP_FOREGROUND_DETACH)
             }
@@ -271,7 +275,7 @@ class RadioService : MediaBrowserServiceCompat() {
             playbackRequested = false
             resumeOnAudioFocusGain = false
             pendingStation = null
-            pendingStationFile = null
+            pendingStationUri = null
             isMuted = true
             exoPlayer.volume = 0.0f
             abandonAudioFocus()
@@ -287,19 +291,13 @@ class RadioService : MediaBrowserServiceCompat() {
         override fun onSkipToNext() {
             Log.d(TAG, "onSkipToNext called")
             // Nächster Sender
-            currentStationIndex = (currentStationIndex + 1) % StationManager.stations.size
-            playStation(StationManager.stations[currentStationIndex])
+            skipStation(1)
         }
 
         override fun onSkipToPrevious() {
             Log.d(TAG, "onSkipToPrevious called")
             // Vorheriger Sender
-            currentStationIndex = if (currentStationIndex - 1 < 0) {
-                StationManager.stations.size - 1
-            } else {
-                currentStationIndex - 1
-            }
-            playStation(StationManager.stations[currentStationIndex])
+            skipStation(-1)
         }
 
         override fun onStop() {
@@ -310,13 +308,39 @@ class RadioService : MediaBrowserServiceCompat() {
             playbackRequested = false
             resumeOnAudioFocusGain = false
             pendingStation = null
-            pendingStationFile = null
+            pendingStationUri = null
             exoPlayer.stop()
             abandonAudioFocus()
             updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
+
+        override fun onCustomAction(action: String?, extras: Bundle?) {
+            if (action == ACTION_REFRESH_LIBRARY) {
+                Log.d(TAG, "Radio folder changed, reloading library")
+                albumArtCache.clear()
+                notifyChildrenChanged(MY_MEDIA_ROOT_ID)
+                notifyChildrenChanged(MY_FAVORITES_ID)
+            }
+        }
+    }
+
+    /**
+     * Springt zum nächsten (+1) bzw. vorherigen (-1) Sender, für den eine Datei vorhanden ist
+     */
+    private fun skipStation(direction: Int) {
+        val size = StationManager.stations.size
+        var index = currentStationIndex
+        repeat(size) {
+            index = (index + direction + size) % size
+            if (RadioFiles.isAvailable(this, StationManager.stations[index])) {
+                currentStationIndex = index
+                playStation(StationManager.stations[index])
+                return
+            }
+        }
+        playStation(StationManager.stations[currentStationIndex])
     }
 
     private fun playStation(station: RadioStation) {
@@ -325,29 +349,38 @@ class RadioService : MediaBrowserServiceCompat() {
         // Sender speichern
         StationManager.saveCurrentStation(this, station.id)
 
-        // Hole die Datei aus der OBB
-        val localFile = ObbHelper.getRadioFile(this, station.assetFileName)
+        // Hole die Datei aus dem gewählten Ordner (oder der OBB)
+        val stationUri = RadioFiles.getStationUri(this, station)
 
-        if (localFile == null || !localFile.exists()) {
+        if (stationUri == null) {
             Log.e(TAG, "Could not load radio file: ${station.assetFileName}")
-            updatePlaybackState(PlaybackStateCompat.STATE_ERROR)
+            updatePlaybackState(
+                PlaybackStateCompat.STATE_ERROR,
+                getString(R.string.error_station_file_missing)
+            )
             return
         }
 
-        Log.d(TAG, "Playing from file: ${localFile.absolutePath}")
-        Log.d(TAG, "File size: ${localFile.length()} bytes")
+        Log.d(TAG, "Playing from: $stationUri")
+
+        // Als gestarteter Service weiterlaufen, auch wenn die Activity sich trennt
+        try {
+            startService(Intent(this, RadioService::class.java))
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "Could not start service, running bound only", e)
+        }
 
         playbackRequested = true
         resumeOnAudioFocusGain = true
         pendingStation = station
-        pendingStationFile = localFile
+        pendingStationUri = stationUri
         isMuted = true
         exoPlayer.volume = 0.0f
 
         // startForeground muss vor requestAudioFocus passieren, sonst wird die Focus-
         // Anfrage bei targetSdk 35+ abgelehnt, wenn Android Auto im Vordergrund ist.
         updatePlaybackState(PlaybackStateCompat.STATE_BUFFERING)
-        updateMetadata(station, localFile)
+        updateMetadata(station)
 
         when (requestAudioFocus()) {
             AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> startPendingStation()
@@ -362,15 +395,14 @@ class RadioService : MediaBrowserServiceCompat() {
 
     private fun startPendingStation() {
         pendingStation ?: return
-        val localFile = pendingStationFile ?: return
+        val uri = pendingStationUri ?: return
         pendingStation = null
-        pendingStationFile = null
+        pendingStationUri = null
         resumeOnAudioFocusGain = false
         isMuted = false
         isDucked = false
         exoPlayer.volume = 1.0f
 
-        val uri = Uri.fromFile(localFile)
         val mediaItem = ExoMediaItem.fromUri(uri)
 
         exoPlayer.setMediaItem(mediaItem)
@@ -395,7 +427,7 @@ class RadioService : MediaBrowserServiceCompat() {
         playbackRequested = false
         resumeOnAudioFocusGain = false
         pendingStation = null
-        pendingStationFile = null
+        pendingStationUri = null
         isMuted = true
         exoPlayer.volume = 0.0f
         exoPlayer.stop()
@@ -453,10 +485,10 @@ class RadioService : MediaBrowserServiceCompat() {
         }
     }
 
-    private fun getAlbumArtBitmapFromFile(file: File): Bitmap? {
+    private fun getAlbumArtBitmap(uri: Uri): Bitmap? {
         val retriever = MediaMetadataRetriever()
         return try {
-            retriever.setDataSource(file.absolutePath)
+            retriever.setDataSource(this, uri)
             val art = retriever.embeddedPicture
             if (art != null && art.isNotEmpty()) {
                 BitmapFactory.decodeByteArray(art, 0, art.size)
@@ -469,12 +501,8 @@ class RadioService : MediaBrowserServiceCompat() {
         }
     }
 
-    private fun updateMetadata(
-        station: RadioStation,
-        localFile: File? = null,
-        showNotification: Boolean = true
-    ) {
-        val albumArtBitmap = localFile?.let { getAlbumArtBitmapFromFile(it) }
+    private fun updateMetadata(station: RadioStation, showNotification: Boolean = true) {
+        val albumArtBitmap = getOrLoadAlbumArt(station)
 
         val metadataBuilder = MediaMetadataCompat.Builder()
             .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, station.id)
@@ -618,14 +646,16 @@ class RadioService : MediaBrowserServiceCompat() {
             if (parentId == MY_MEDIA_ROOT_ID) {
                 mediaItems.add(createBrowsableItem(MY_FAVORITES_ID, "Favoriten", "Deine Top 4", null))
 
-                StationManager.stations.forEach { station ->
-                    val albumArt = getOrLoadAlbumArt(station)
-                    mediaItems.add(createPlayableItem(station, albumArt))
-                }
+                StationManager.stations
+                    .filter { RadioFiles.isAvailable(this, it) }
+                    .forEach { station ->
+                        val albumArt = getOrLoadAlbumArt(station)
+                        mediaItems.add(createPlayableItem(station, albumArt))
+                    }
             } else if (parentId == MY_FAVORITES_ID) {
                 StationManager.favoriteIds.forEach { favId ->
                     val station = StationManager.getStationById(favId)
-                    if (station != null) {
+                    if (station != null && RadioFiles.isAvailable(this, station)) {
                         val albumArt = getOrLoadAlbumArt(station)
                         mediaItems.add(createPlayableItem(station, albumArt))
                     }
@@ -641,16 +671,11 @@ class RadioService : MediaBrowserServiceCompat() {
         albumArtCache[station.id]?.let { return it }
 
         // Lade aus Datei
-        val localFile = ObbHelper.getRadioFile(this, station.assetFileName)
-        if (localFile != null && localFile.exists()) {
-            val bitmap = getAlbumArtBitmapFromFile(localFile)
-            if (bitmap != null) {
-                albumArtCache[station.id] = bitmap
-                return bitmap
-            }
+        val bitmap = RadioFiles.getStationUri(this, station)?.let { getAlbumArtBitmap(it) }
+        if (bitmap != null) {
+            albumArtCache[station.id] = bitmap
         }
-
-        return null
+        return bitmap
     }
 
     private fun createPlayableItem(station: RadioStation, albumArt: Bitmap? = null): MediaItem {

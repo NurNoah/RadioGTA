@@ -1,3 +1,14 @@
 <resources>
     <string name="app_name">RadioGTA</string>
+    <string name="choose_folder">MP3-Ordner auswählen</string>
+    <string name="change_folder">MP3-Ordner ändern</string>
+    <string name="status_no_folder">Noch kein Ordner gewählt. Wähle den Ordner mit deinen Sender-MP3s aus.</string>
+    <string name="status_stations_found">%1$d von %2$d Sendern gefunden</string>
+    <string name="station_file_missing">%1$s · Datei fehlt (%2$s)</string>
+    <string name="now_playing_nothing">Tippe auf einen Sender</string>
+    <string name="error_station_file_missing">Keine Audiodatei für diesen Sender gefunden</string>
+    <string name="previous_station">Vorheriger Sender</string>
+    <string name="next_station">Nächster Sender</string>
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
 </resources>

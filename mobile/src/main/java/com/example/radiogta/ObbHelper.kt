@@ -41,6 +41,26 @@ object ObbHelper {
         return null
     }
 
+    /**
+     * Prüft ob die Datei im Cache oder in einer OBB liegt, ohne sie zu entpacken
+     */
+    fun hasRadioFile(context: Context, assetFileName: String): Boolean {
+        val cacheDir = File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "radio_cache")
+        val cachedFile = File(cacheDir, assetFileName)
+        if (cachedFile.exists() && cachedFile.length() > 0) return true
+
+        val internalPath = "radio/$assetFileName"
+        return listOf("patch", "main").any { type ->
+            val obb = getObbFile(context, type) ?: return@any false
+            try {
+                ZipFile(obb).use { it.getEntry(internalPath) != null }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error reading OBB: ${obb.name}", e)
+                false
+            }
+        }
+    }
+
     private fun getObbFile(context: Context, type: String): File? {
         val obbDir = context.obbDir ?: return null
         // Format: main.1.com.package.obb oder patch.1.com.package.obb

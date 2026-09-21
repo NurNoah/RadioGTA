@@ -34,7 +34,6 @@ object StationManager {
         RadioStation("east_los_fm", "East Los FM", "Mexican Electronica", "east_los_fm.mp3"),
         RadioStation("flylo_fm", "FlyLo FM", "IDM / Experimental", "flylo_fm.mp3"),
         RadioStation("los_santos_underground", "LS Underground Radio", "House / Techno", "los_santos_underground_radio.mp3"),
-        RadioStation("non_stop_pop", "Non-Stop-Pop FM", "Pop / Dance", "non_stop_pop_fm.mp3"),
         RadioStation("radio_los_santos", "Radio Los Santos", "Modern Hip Hop", "radio_los_santos.mp3"),
         RadioStation("radio_mirror_park", "Radio Mirror Park", "Indie Pop", "radio_mirror_park.mp3"),
         RadioStation("rebel_radio", "Rebel Radio", "Country", "rebel_radio.mp3"),

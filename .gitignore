@@ -15,6 +15,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+keystore.properties
+*.keystore
+*.jks
 /obb_output/
 /radio_files/
 /temp_obb/
