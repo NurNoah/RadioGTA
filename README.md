@@ -20,6 +20,8 @@ Das Besondere: Die Sender laufen wie echtes Radio. Jeder Sender läuft "im Hinte
 
 ### 2. Sender-Dateien aufs Handy kopieren
 
+https://two66.com/mirrors/?dir=GTA-Radio-Stations%2FGTA-V
+
 Lege auf dem Handy einen Ordner an, z. B. `Music/GTARadio`, und kopiere deine Sender-Dateien hinein (per USB-Kabel, Cloud, Quick Share – egal wie). Pro Sender eine Datei, benannt wie in der [Tabelle unten](#dateinamen-der-sender).
 
 > 💡 **Du brauchst nur die MP3-Dateien.** Falls du die Sender auch als FLAC hast: nicht nötig. FLAC ist um ein Vielfaches größer (alle 20 Sender als MP3 sind zusammen ca. 5 GB) und klingt im Auto oder über Bluetooth nicht hörbar besser. Die App spielt FLAC zwar ab, aber es reicht eine Datei pro Sender.
